@@ -14858,7 +14858,7 @@ class TestTorchDeviceType(TestCase):
                 lambda x, y: x.expm1_(),
                 lambda x, y: x.floor(),
                 lambda x, y: x.floor_(),
-                # lambda x, y: x.fmod(2), # https://github.com/pytorch/pytorch/issues/24565
+                lambda x, y: x.fmod(2),
                 lambda x, y: x.frac(),
                 lambda x, y: x.hypot(y),
                 lambda x, y: x.hypot_(y),
@@ -17093,27 +17093,140 @@ scipy_lobpcg  | {:10.2e}  | {:10.2e}  | {:6} | N/A
         z = torch.tensor([30 / v.item() for v in x], device=device)
         self.assertEqual(y, z, exact_dtype=False)
 
-    @onlyCPU
-    @dtypes(*torch.testing.get_all_dtypes(include_bfloat16=False, include_bool=False, include_complex=False))
-    def test_fmod(self, device, dtype):
-        m1 = torch.Tensor(10, 10).uniform_(-10., 10.).to(dtype=dtype, device=device)
-        res1 = m1.clone()
-        q = 3
-        res1[:, 3].fmod_(q)
-        res2 = m1.clone()
-        for i in range(m1.size(1)):
-            res2[i, 3] = math.fmod(res2[i, 3], q)
-        self.assertEqual(res1, res2)
+    @dtypes(*torch.testing.get_all_fp_dtypes(include_bfloat16=False))
+    def test_fmod_by_zero_float(self, device, dtype):
+        # check floating-point tensor fmod to zero is nan on both CPU and GPU
+        x = make_tensor((10, 10), device=device, dtype=dtype, low=-9, high=9)
+        zero = torch.zeros_like(x)
 
-        zero = torch.zeros_like(m1)
-        if dtype in torch.testing.get_all_int_dtypes():
+        self.assertTrue(torch.all(x.fmod(0.0).isnan()))
+        self.assertTrue(torch.all(x.fmod(zero).isnan()))
+        # out
+        out = torch.empty(0, device=device, dtype=dtype)
+        torch.fmod(x, zero, out=out)
+        self.assertEqual(out.size(), torch.Size([10, 10]))
+        self.assertTrue(torch.all(out.isnan()))
+        # in-place
+        x.fmod_(zero)
+        self.assertTrue(torch.all(x.isnan()))
+
+    @skipCUDAIfRocm  # Check Issue https://github.com/pytorch/pytorch/issues/48130
+    @dtypes(*torch.testing.get_all_int_dtypes())
+    def test_fmod_by_zero_integral(self, device, dtype):
+        # check integral tensor fmod to zero
+        x = make_tensor((10, 10), device=device, dtype=dtype, low=-9, high=9)
+        zero = torch.zeros_like(x)
+        # out
+        out = torch.empty(0, device=device, dtype=dtype)
+        # In-place
+        x_ = x.clone()
+        # RuntimeError on CPU
+        if device == 'cpu':
             with self.assertRaisesRegex(RuntimeError, "ZeroDivisionError"):
-                m1.fmod(0)
+                x.fmod(zero)
             with self.assertRaisesRegex(RuntimeError, "ZeroDivisionError"):
-                m1.fmod(zero)
+                torch.fmod(x, zero, out=out)
+            with self.assertRaisesRegex(RuntimeError, "ZeroDivisionError"):
+                x.fmod_(zero)
+        # Different value for different dtype on GPU
         else:
-            self.assertTrue(torch.all(m1.fmod(0).isnan()))
-            self.assertTrue(torch.all(m1.fmod(zero).isnan()))
+            if dtype == torch.int64:
+                self.assertEqual(x.fmod(zero) == 4294967295, x >= 0)
+                self.assertEqual(x.fmod(zero) == -1, x < 0)
+                # out
+                torch.fmod(x, zero, out=out)
+                self.assertEqual(out == 4294967295, x >= 0)
+                self.assertEqual(out == -1, x < 0)
+                self.assertEqual(out.size(), torch.Size([10, 10]))
+                # in-place
+                x_.fmod_(zero)
+                self.assertEqual(x_ == 4294967295, x >= 0)
+                self.assertEqual(x_ == -1, x < 0)
+            else:
+                value = 255 if dtype == torch.uint8 else -1
+                self.assertTrue(torch.all(x.fmod(zero) == value))
+                # out
+                torch.fmod(x, zero, out=out)
+                self.assertTrue(torch.all(out == value))
+                self.assertEqual(out.size(), torch.Size([10, 10]))
+                # in-place
+                x_.fmod_(zero)
+                self.assertTrue(torch.all(x_ == value))
+
+    # TO DO
+    # Cross product dtypes after fix type promotion
+    # Issue #47779: https://github.com/pytorch/pytorch/issues/47779
+    @dtypes(*torch.testing.get_all_dtypes(include_bfloat16=False, include_bool=False, include_complex=False))
+    @unittest.skipIf(not TEST_NUMPY, "NumPy not found")
+    def test_fmod(self, device, dtype):
+        # Use numpy as reference
+        def _reference_implementation(x, mod):
+            res = torch.fmod(x, mod)
+            # out
+            out = torch.empty(0, device=device, dtype=x.dtype)
+            torch.fmod(x, mod, out=out)
+            # in-place
+            x_ = x.clone()
+            x_.fmod_(mod)
+            # Numpy cast to integral due to non type promotion
+            if torch.is_tensor(mod):
+                if x.dtype in torch.testing.get_all_int_dtypes() and mod.dtype != dtype:
+                    mod = mod.to(dtype)
+                mod = mod.cpu().numpy()
+            else:
+                if x.dtype in torch.testing.get_all_int_dtypes():
+                    mod = int(mod)
+            np_x = x.cpu().numpy()
+            exp = np.fmod(np_x, mod)
+            exp = torch.from_numpy(exp)
+
+            res = res.to(exp.dtype)
+            self.assertEqual(res, exp)
+            # out
+            out.to(exp.dtype)
+            self.assertEqual(out, exp)
+            self.assertEqual(out.size(), torch.Size([10, 10]))
+            # in-place
+            x_ = x_.to(exp.dtype)
+            self.assertEqual(x_, exp)
+
+        x = make_tensor((10, 10), device=device, dtype=dtype, low=-9, high=9)
+        # Exclude 0
+        # mod with same dtype as x
+        mod = make_tensor((10, 10), device=device, dtype=dtype, low=1, high=9)
+        # mod with floating-point dtype
+        mod_float = make_tensor((10, 10), device=device, 
+                                dtype=torch.float if dtype in torch.testing.get_all_int_dtypes() else dtype, 
+                                low=1, high=9)
+        # non-contiguous
+        x_nc = x.t()
+        mod_nc = mod.t()
+
+        # fmod to Integer Scalar
+        _reference_implementation(x, 3)
+        _reference_implementation(x_nc, 3)
+        # fmod to Float Scalar
+        _reference_implementation(x, 2.3)
+        _reference_implementation(x_nc, 2.3)
+        # fmod to Tensor with same dtype 
+        # cross-product of contiguous and non-contiguous Tensors
+        _reference_implementation(x, mod)
+        _reference_implementation(x_nc, mod)
+        _reference_implementation(x, mod_nc)
+        _reference_implementation(x_nc, mod_nc)
+
+        # fmod to float Tensor
+        if dtype in torch.testing.get_all_int_dtypes():
+            with self.assertRaisesRegex(RuntimeError, "result type (Half|Float|Double) "
+                                                      "can't be cast to the desired "
+                                                      "output type (Byte|Char|Short|Int|Long)"):
+                x.fmod(mod_float)
+        else:
+            _reference_implementation(x, mod_float)
+
+    @dtypes(*torch.testing.get_all_dtypes(include_bfloat16=False, include_bool=False, include_complex=False))
+    def test_fmod_(self, device, dtype):
+        x = make_tensor((10, 10), device=device, dtype=dtype, low=-9, high=9)
 
     @onlyCPU
     @dtypes(torch.float, torch.long)
@@ -17838,11 +17951,6 @@ else:
     @dtypes(torch.float)
     def test_cdiv(self, device, dtype):
         self._test_cop(torch.div, lambda x, y: x / y, dtype, device)
-
-    @onlyCPU
-    @dtypes(torch.float)
-    def test_cfmod(self, device, dtype):
-        self._test_cop(torch.fmod, math.fmod, dtype, device)
 
     @onlyCPU
     @dtypes(torch.float)
